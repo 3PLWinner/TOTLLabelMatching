@@ -29,8 +29,8 @@ ERRORS_PREFIX = "errors/"
 VERACORE_BASE_URL = "https://wms.3plwinner.com/VeraCore/Public.Api/api"
 
 # Update these to match your VeraCore report
-ORDER_REPORT_NAME = "Open Orders"  # <-- Your report name
-ORDER_ID_COLUMN = "OrderID"        # <-- Column name in report
+ORDER_REPORT_NAME = "OPENORDERS"  # <-- Your report name
+ORDER_ID_COLUMN = "Order ID"        # <-- Column name in report
 
 s3 = boto3.client("s3")
 sns = boto3.client("sns")
