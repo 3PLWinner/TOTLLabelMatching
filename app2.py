@@ -2,7 +2,7 @@
 # label_printer_app.py
 # Streamlit app for warehouse team to manage labels
 #
-# pip install streamlit boto3 PyPDF2
+# pip install streamlit boto3
 # streamlit run label_printer_app.py
 ##############################################################
 
@@ -11,9 +11,9 @@ import boto3
 import os
 import io
 import time
+import zipfile
 from datetime import datetime
 from botocore.exceptions import ClientError
-from PyPDF2 import PdfWriter, PdfReader
 
 # --- Config ---
 BUCKET_NAME = "vwslabels"
@@ -92,30 +92,27 @@ def delete_file(key):
 
 
 # =========================================================
-# PDF Merge
+# Zip Bundle
 # =========================================================
-def merge_pdfs(files):
-    writer = PdfWriter()
+def bundle_zip(files):
+    """Download files from S3 and bundle into a zip."""
+    buf = io.BytesIO()
     skipped = []
-    for f in files:
-        try:
-            pdf_bytes = get_file_bytes(f["key"])
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            for page in reader.pages:
-                writer.add_page(page)
-        except Exception:
-            skipped.append(f["filename"])
-    output = io.BytesIO()
-    writer.write(output)
-    output.seek(0)
-    return output.getvalue(), skipped
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            try:
+                pdf_bytes = get_file_bytes(f["key"])
+                zf.writestr(f["filename"], pdf_bytes)
+            except Exception:
+                skipped.append(f["filename"])
+    buf.seek(0)
+    return buf.getvalue(), skipped
 
 
 # =========================================================
 # Parse Order IDs from text input
 # =========================================================
 def parse_order_ids(text):
-    """Parse order IDs from text — supports comma, space, newline separated."""
     ids = []
     for line in text.replace(",", "\n").split("\n"):
         cleaned = line.strip()
@@ -161,45 +158,38 @@ with tab_print:
     if not processed:
         st.info("No labels waiting to be printed.")
     else:
-        # --- Print All Section ---
-        st.subheader("Print All Labels")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**{len(processed)} label(s)** ready to print")
-        with col2:
-            if st.button("📄 Generate All", type="primary", use_container_width=True):
-                with st.spinner("Merging PDFs..."):
-                    merged_pdf, skipped = merge_pdfs(processed)
-                st.session_state["merged_all_pdf"] = merged_pdf
-                st.session_state["merged_all_files"] = processed
-                st.session_state["skipped_all"] = skipped
+        # --- Download All / Move All ---
+        st.subheader("All Labels")
+        st.write(f"**{len(processed)} label(s)** ready to print")
 
-        if "merged_all_pdf" in st.session_state:
-            skipped = st.session_state.get("skipped_all", [])
-            if skipped:
-                st.warning(f"Skipped {len(skipped)} non-PDF file(s): {', '.join(skipped)}")
-            dl_col, move_col = st.columns(2)
-            with dl_col:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button(
-                    "⬇️ Download All Labels",
-                    data=st.session_state["merged_all_pdf"],
-                    file_name=f"labels_all_{ts}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            with move_col:
-                if st.button("✅ Mark All as Printed", use_container_width=True):
-                    with st.spinner("Moving files..."):
-                        move_files_bulk(st.session_state["merged_all_files"], PRINTED_PREFIX)
-                    del st.session_state["merged_all_pdf"]
-                    del st.session_state["merged_all_files"]
-                    del st.session_state["skipped_all"]
-                    st.success("All labels moved to printed.")
-                    time.sleep(1)
-                    st.rerun()
+        col_dl, col_move = st.columns(2)
+        with col_dl:
+            if st.button("📦 Download All as Zip", type="primary", use_container_width=True):
+                with st.spinner("Bundling..."):
+                    zip_bytes, skipped = bundle_zip(processed)
+                st.session_state["zip_all"] = zip_bytes
+                if skipped:
+                    st.warning(f"Skipped: {', '.join(skipped)}")
 
-        # --- Select by Order ID Section ---
+        with col_move:
+            if st.button("✅ Move All to Printed", use_container_width=True):
+                with st.spinner("Moving files..."):
+                    move_files_bulk(processed, PRINTED_PREFIX)
+                st.success("All labels moved to printed.")
+                time.sleep(1)
+                st.rerun()
+
+        if "zip_all" in st.session_state:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                "⬇️ Save Zip File",
+                data=st.session_state["zip_all"],
+                file_name=f"labels_all_{ts}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+
+        # --- Select by Order ID ---
         st.divider()
         st.subheader("Print by Order ID")
         order_input = st.text_area(
@@ -210,7 +200,6 @@ with tab_print:
 
         if order_input.strip():
             requested_ids = parse_order_ids(order_input)
-            # Build lookup from processed files
             file_lookup = {f["order_id"]: f for f in processed}
 
             matched_files = []
@@ -226,43 +215,37 @@ with tab_print:
             if matched_files:
                 st.success(f"Found {len(matched_files)} of {len(requested_ids)} label(s)")
 
-                if st.button("📄 Generate Selected Batch", use_container_width=True):
-                    with st.spinner("Merging selected PDFs..."):
-                        merged_pdf, skipped = merge_pdfs(matched_files)
-                    st.session_state["merged_sel_pdf"] = merged_pdf
-                    st.session_state["merged_sel_files"] = matched_files
-                    st.session_state["skipped_sel"] = skipped
+                sel_dl, sel_move = st.columns(2)
+                with sel_dl:
+                    if st.button("📦 Download Selected as Zip", use_container_width=True):
+                        with st.spinner("Bundling..."):
+                            zip_bytes, skipped = bundle_zip(matched_files)
+                        st.session_state["zip_sel"] = zip_bytes
+                        st.session_state["zip_sel_files"] = matched_files
+                        if skipped:
+                            st.warning(f"Skipped: {', '.join(skipped)}")
 
-                if "merged_sel_pdf" in st.session_state:
-                    skipped = st.session_state.get("skipped_sel", [])
-                    if skipped:
-                        st.warning(f"Skipped {len(skipped)} file(s): {', '.join(skipped)}")
-                    dl_col, move_col = st.columns(2)
-                    with dl_col:
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        st.download_button(
-                            "⬇️ Download Selected Labels",
-                            data=st.session_state["merged_sel_pdf"],
-                            file_name=f"labels_selected_{ts}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                        )
-                    with move_col:
-                        if st.button("✅ Mark Selected as Printed", use_container_width=True):
-                            with st.spinner("Moving files..."):
-                                move_files_bulk(st.session_state["merged_sel_files"], PRINTED_PREFIX)
-                            del st.session_state["merged_sel_pdf"]
-                            del st.session_state["merged_sel_files"]
-                            del st.session_state["skipped_sel"]
-                            st.success("Selected labels moved to printed.")
-                            time.sleep(1)
-                            st.rerun()
-            elif not not_found_ids:
-                st.info("Enter Order IDs above to search.")
+                with sel_move:
+                    if st.button("✅ Mark Selected as Printed", use_container_width=True):
+                        with st.spinner("Moving files..."):
+                            move_files_bulk(matched_files, PRINTED_PREFIX)
+                        st.success("Selected labels moved to printed.")
+                        time.sleep(1)
+                        st.rerun()
+
+                if "zip_sel" in st.session_state:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    st.download_button(
+                        "⬇️ Save Selected Zip",
+                        data=st.session_state["zip_sel"],
+                        file_name=f"labels_selected_{ts}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
 
         # --- Individual File List ---
         st.divider()
-        st.subheader("All Labels")
+        st.subheader("Individual Labels")
         for f in processed:
             with st.container():
                 col1, col2, col3 = st.columns([4, 3, 1])
